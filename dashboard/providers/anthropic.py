@@ -7,12 +7,16 @@ normalising the response into the common DataFrame schema.
 Requires ANTHROPIC_ADMIN_KEY environment variable.
 """
 
+import logging
 import os
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
 import httpx
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 from dashboard.providers.base import ProviderClient, ProviderData
 
@@ -33,7 +37,6 @@ class AnthropicProviderClient(ProviderClient):
             headers={
                 "x-api-key": api_key,
                 "anthropic-version": self.ANTHROPIC_VERSION,
-                "Content-Type": "application/json",
             },
             timeout=30.0,
         )
@@ -42,24 +45,25 @@ class AnthropicProviderClient(ProviderClient):
     def is_configured(cls) -> bool:
         return bool(os.environ.get("ANTHROPIC_ADMIN_KEY"))
 
+    CHUNK_DELAY_SECONDS = 2      # pause between date-range chunks
+    RATE_LIMIT_RETRY_SECONDS = 60  # wait on 429 before retrying once
+
     def _get_paginated(self, endpoint: str, params: dict, data_key: str = "data") -> list[dict]:
-        """Fetch all pages, using bracket notation for array params."""
+        """Fetch all pages, letting httpx handle query string encoding.
+
+        Retries once after RATE_LIMIT_RETRY_SECONDS on a 429 response.
+        """
         all_data = []
         url = f"{self.BASE_URL}/{endpoint}"
+        current_params = dict(params)
 
-        def build_url(p: dict) -> str:
-            parts = []
-            for key, value in p.items():
-                if isinstance(value, list):
-                    for item in value:
-                        parts.append(f"{key}[]={item}")
-                else:
-                    parts.append(f"{key}={value}")
-            return f"{url}?{'&'.join(parts)}" if parts else url
-
-        full_url = build_url(params)
         while True:
-            response = self._client.get(full_url)
+            response = self._client.get(url, params=current_params)
+            if response.status_code == 429:
+                logger.warning("Anthropic rate limit hit, waiting %ds before retry…", self.RATE_LIMIT_RETRY_SECONDS)
+                time.sleep(self.RATE_LIMIT_RETRY_SECONDS)
+                response = self._client.get(url, params=current_params)
+
             if response.status_code >= 400:
                 try:
                     error_detail = response.json()
@@ -74,8 +78,7 @@ class AnthropicProviderClient(ProviderClient):
             all_data.extend(result.get(data_key, []))
 
             if result.get("has_more") and result.get("next_page"):
-                params["page"] = result["next_page"]
-                full_url = build_url(params)
+                current_params = {**params, "page": result["next_page"]}
             else:
                 break
 
@@ -103,31 +106,37 @@ class AnthropicProviderClient(ProviderClient):
         rows = []
         for chunk_start, chunk_end in self._date_chunks(start_time, end_time):
             params = {
-                "start_date": chunk_start.strftime("%Y-%m-%d"),
-                "end_date": chunk_end.strftime("%Y-%m-%d"),
-                "group_by": ["workspace_id"],
+                "starting_at": chunk_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "ending_at": chunk_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "bucket_width": "1d",
+                "group_by[]": ["workspace_id", "description"],
             }
             try:
-                data = self._get_paginated("organizations/cost_report", params)
-            except Exception:
+                buckets = self._get_paginated("organizations/cost_report", params)
+            except Exception as e:
+                logger.error("Anthropic cost_report error (%s–%s): %s", chunk_start.date(), chunk_end.date(), e)
                 continue
+            finally:
+                time.sleep(self.CHUNK_DELAY_SECONDS)
 
-            for item in data:
-                ts = self._parse_timestamp(item.get("timestamp"))
-                date = ts.date() if ts else chunk_start.date()
-                try:
-                    cost_usd = float(item.get("amount_in_cents", 0) or 0) / 100.0
-                except (ValueError, TypeError):
-                    cost_usd = 0.0
-                rows.append({
-                    "date": datetime.combine(date, datetime.min.time()),
-                    "start_time": int(datetime.combine(date, datetime.min.time()).timestamp()),
-                    "end_time": int((datetime.combine(date, datetime.min.time()) + timedelta(days=1)).timestamp()),
-                    "provider": "anthropic",
-                    "project_id": item.get("workspace_id") or "default",
-                    "line_item": item.get("description") or "unknown",
-                    "cost_usd": cost_usd,
-                })
+            for bucket in buckets:
+                bucket_start = self._parse_timestamp(bucket.get("starting_at"))
+                date = bucket_start.date() if bucket_start else chunk_start.date()
+                date_dt = datetime.combine(date, datetime.min.time())
+                for item in bucket.get("results", []):
+                    try:
+                        cost_usd = float(item.get("amount", 0) or 0) / 100.0
+                    except (ValueError, TypeError):
+                        cost_usd = 0.0
+                    rows.append({
+                        "date": date_dt,
+                        "start_time": int(date_dt.timestamp()),
+                        "end_time": int((date_dt + timedelta(days=1)).timestamp()),
+                        "provider": "anthropic",
+                        "project_id": item.get("workspace_id") or "default",
+                        "line_item": item.get("description") or "unknown",
+                        "cost_usd": cost_usd,
+                    })
 
         df = pd.DataFrame(rows)
         if not df.empty:
@@ -137,43 +146,48 @@ class AnthropicProviderClient(ProviderClient):
 
     def get_usage(self, start_time: datetime, end_time: datetime) -> pd.DataFrame:
         rows = []
+
+        def safe_int(val):
+            try:
+                return int(val) if val else 0
+            except (ValueError, TypeError):
+                return 0
+
         for chunk_start, chunk_end in self._date_chunks(start_time, end_time):
             params = {
-                "start_date": chunk_start.strftime("%Y-%m-%d"),
-                "end_date": chunk_end.strftime("%Y-%m-%d"),
-                "group_by": ["workspace_id", "model"],
+                "starting_at": chunk_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "ending_at": chunk_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "bucket_width": "1d",
+                "group_by[]": ["workspace_id", "model"],
             }
             try:
-                data = self._get_paginated("organizations/usage_report/messages", params)
-            except Exception:
+                buckets = self._get_paginated("organizations/usage_report/messages", params)
+            except Exception as e:
+                logger.error("Anthropic usage_report error (%s–%s): %s", chunk_start.date(), chunk_end.date(), e)
                 continue
+            finally:
+                time.sleep(self.CHUNK_DELAY_SECONDS)
 
-            for item in data:
-                ts = self._parse_timestamp(item.get("timestamp"))
-                date = ts.date() if ts else chunk_start.date()
+            for bucket in buckets:
+                bucket_start = self._parse_timestamp(bucket.get("starting_at"))
+                date = bucket_start.date() if bucket_start else chunk_start.date()
                 date_dt = datetime.combine(date, datetime.min.time())
-
-                def safe_int(val):
-                    try:
-                        return int(val) if val else 0
-                    except (ValueError, TypeError):
-                        return 0
-
-                input_tokens = safe_int(item.get("input_tokens", 0))
-                output_tokens = safe_int(item.get("output_tokens", 0))
-                rows.append({
-                    "date": date_dt,
-                    "start_time": int(date_dt.timestamp()),
-                    "end_time": int((date_dt + timedelta(days=1)).timestamp()),
-                    "provider": "anthropic",
-                    "project_id": item.get("workspace_id") or "default",
-                    "model": item.get("model") or "unknown",
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "input_cached_tokens": safe_int(item.get("cache_read_input_tokens", 0)),
-                    "num_model_requests": 0,
-                    "total_tokens": input_tokens + output_tokens,
-                })
+                for item in bucket.get("results", []):
+                    input_tokens = safe_int(item.get("uncached_input_tokens", 0))
+                    output_tokens = safe_int(item.get("output_tokens", 0))
+                    rows.append({
+                        "date": date_dt,
+                        "start_time": int(date_dt.timestamp()),
+                        "end_time": int((date_dt + timedelta(days=1)).timestamp()),
+                        "provider": "anthropic",
+                        "project_id": item.get("workspace_id") or "default",
+                        "model": item.get("model") or "unknown",
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "input_cached_tokens": safe_int(item.get("cache_read_input_tokens", 0)),
+                        "num_model_requests": 0,
+                        "total_tokens": input_tokens + output_tokens,
+                    })
 
         df = pd.DataFrame(rows)
         if not df.empty:
