@@ -1,0 +1,14 @@
+services:
+  ai-dashboard:
+    build: .
+    ports:
+      - "8050:8050"  # Dash default port (changed from 7860 for Gradio)
+    volumes:
+      - dashboard_data:/app/data
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  dashboard_data:
+
