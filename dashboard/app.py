@@ -118,7 +118,7 @@ def backfill_historical_data(providers=None) -> None:
         p for p in _configured_providers if needs_backfill(p.PROVIDER_NAME)
     ]
     for provider_client in targets:
-        logger.info(f"Backfilling {provider_client.PROVIDER_NAME} from 2024-01-01...")
+        logger.info(f"Backfilling {provider_client.PROVIDER_NAME} from {os.environ.get("BACKFILL_START_DATE", "2026-01-01")}...")
         try:
             costs_df = provider_client.get_costs(start_time, end_time)
             usage_df = provider_client.get_usage(start_time, end_time)
