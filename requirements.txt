@@ -1,0 +1,16 @@
+streamlit
+pandas
+plotly>=5.18.0
+pathlib
+gradio>=4.0.0
+httpx>=0.25.0
+python-dotenv>=1.0.0
+apscheduler
+pyecharts
+dash>=2.14.0
+dash-bootstrap-components>=1.5.0
+
+
+
+
+
