@@ -96,13 +96,23 @@ for _cls in [OpenAIProviderClient, AnthropicProviderClient]:
 # Data helpers
 # ---------------------------------------------------------------------------
 
+def _backfill_start_time() -> datetime:
+    """Return the backfill start date from BACKFILL_START_DATE env var (YYYY-MM-DD), defaulting to 2026-01-01."""
+    raw = os.environ.get("BACKFILL_START_DATE", "2026-01-01")
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d")
+    except ValueError:
+        logger.warning("Invalid BACKFILL_START_DATE %r, using 2026-01-01", raw)
+        return datetime(2026, 1, 1)
+
+
 def backfill_historical_data(providers=None) -> None:
-    """Fetch and store historical data from 2024-01-01.
+    """Fetch and store historical data from BACKFILL_START_DATE (default 2026-01-01).
 
     Only runs for providers that actually need a backfill (i.e. have no rows in
     the DB yet). Passing an explicit list overrides this check.
     """
-    start_time = datetime(2024, 1, 1)
+    start_time = _backfill_start_time()
     end_time = datetime.utcnow()
     targets = providers if providers is not None else [
         p for p in _configured_providers if needs_backfill(p.PROVIDER_NAME)
