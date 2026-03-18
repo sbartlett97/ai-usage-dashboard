@@ -34,6 +34,7 @@ from dashboard.data.store import (
     get_database_stats,
     get_last_updated,
     get_provider_last_updated,
+    get_provider_max_date,
     init_database,
     load_all_data,
     load_projects,
@@ -135,13 +136,17 @@ def backfill_historical_data(providers=None) -> None:
 def fetch_incremental_data() -> None:
     """Fetch new data since last update for each configured provider."""
     for provider_client in _configured_providers:
-        last = get_provider_last_updated(provider_client.PROVIDER_NAME) or get_last_updated()
-        if last is None:
+        meta_ts = get_provider_last_updated(provider_client.PROVIDER_NAME)
+        db_max = get_provider_max_date(provider_client.PROVIDER_NAME)
+
+        if meta_ts is None and db_max is None:
             logger.warning(f"No last_updated for {provider_client.PROVIDER_NAME}, running backfill")
             backfill_historical_data(providers=[provider_client])
             continue
 
-        start_time = last - timedelta(days=1)
+        # Use the earlier of the two so gaps between metadata and actual DB data are healed
+        anchor = min(t for t in [meta_ts, db_max] if t is not None)
+        start_time = anchor - timedelta(days=1)
         end_time = datetime.utcnow()
         logger.info(f"Fetching incremental {provider_client.PROVIDER_NAME} from {start_time.date()}")
         try:
